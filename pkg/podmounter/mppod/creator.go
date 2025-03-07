@@ -50,7 +50,7 @@ func NewCreator(config Config) *Creator {
 // The name of the Mountpoint Pod is consistently generated from `pod` and `pvc` using `MountpointPodNameFor` function.
 func (c *Creator) Create(pod *corev1.Pod, pvc *corev1.PersistentVolumeClaim) *corev1.Pod {
 	node := pod.Spec.NodeName
-	name := MountpointPodNameFor(string(pod.UID), pvc.Spec.VolumeName)
+	name := MountpointPodNameFor(node, pvc.Spec.VolumeName)
 
 	return &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{

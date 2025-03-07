@@ -10,6 +10,7 @@ import (
 	"k8s.io/mount-utils"
 
 	"github.com/awslabs/aws-s3-csi-driver/pkg/driver/node/credentialprovider"
+	"github.com/awslabs/aws-s3-csi-driver/pkg/driver/node/targetpath"
 	"github.com/awslabs/aws-s3-csi-driver/pkg/mountpoint"
 	"github.com/awslabs/aws-s3-csi-driver/pkg/system"
 )
@@ -64,4 +65,28 @@ func isMountPoint(mounter mount.Interface, target string) (bool, error) {
 		}
 	}
 	return false, nil
+}
+
+func bindMountCount(mounter mount.Interface, source string) (int, error) {
+	counter := 0
+	if _, err := os.Stat(source); os.IsNotExist(err) {
+		return counter, err
+	}
+
+	sourceVolumeName, _ := targetpath.VolumeNameFromSourceMountPath(source)
+
+	mountPoints, err := mounter.List()
+	if err != nil {
+		return counter, fmt.Errorf("Failed to list mounts: %w", err)
+	}
+	for _, mp := range mountPoints {
+		if mp.Device == mountpointDeviceName {
+			tp, _ := targetpath.Parse(mp.Path)
+			if sourceVolumeName == tp.VolumeID {
+				klog.V(4).Infof("S3 BIND MOUNT FOUND: path: %s type: %s device: %s opts: %v pass: %d freq: %d", mp.Path, mp.Type, mp.Device, mp.Opts, mp.Pass, mp.Freq)
+				counter++
+			}
+		}
+	}
+	return counter, nil
 }

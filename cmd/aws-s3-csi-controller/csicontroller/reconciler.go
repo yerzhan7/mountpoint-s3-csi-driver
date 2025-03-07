@@ -164,7 +164,7 @@ func (r *Reconciler) spawnOrDeleteMountpointPodIfNeeded(
 	pv *corev1.PersistentVolume,
 	csiSpec *corev1.CSIPersistentVolumeSource,
 ) error {
-	mpPodName := mppod.MountpointPodNameFor(string(workloadPod.UID), pvc.Spec.VolumeName)
+	mpPodName := mppod.MountpointPodNameFor(workloadPod.Spec.NodeName, pvc.Spec.VolumeName)
 
 	log := logf.FromContext(ctx).WithValues(
 		"workloadPod", types.NamespacedName{Namespace: workloadPod.Namespace, Name: workloadPod.Name},

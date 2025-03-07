@@ -13,6 +13,8 @@ var (
 	targetPathRegexp              = regexp.MustCompile("/pods/(?P<podid>[^/]+)/volumes/kubernetes.io~csi/(?P<volumeid>[^/]+)/mount$")
 	targetPathRegexpPodIdIndex    = targetPathRegexp.SubexpIndex("podid")
 	targetPathRegexpVolumeIdIndex = targetPathRegexp.SubexpIndex("volumeid")
+	sourcePathRegexp              = regexp.MustCompile("/var/lib/kubelet/plugins/s3.csi.aws.com/mnt/(?P<volumeid>[^/]+)$")
+	sourcePathRegexpVolumeIdIndex = sourcePathRegexp.SubexpIndex("volumeid")
 )
 
 // A TargetPath represents a parsed target path from Kubernetes.
@@ -34,4 +36,13 @@ func Parse(path string) (TargetPath, error) {
 		VolumeID: matches[targetPathRegexpVolumeIdIndex],
 		PodID:    matches[targetPathRegexpPodIdIndex],
 	}, nil
+}
+
+func VolumeNameFromSourceMountPath(sourceMountPath string) (string, error) {
+	matches := sourcePathRegexp.FindStringSubmatch(sourceMountPath)
+	if len(matches) < sourcePathRegexpVolumeIdIndex {
+		return "", ErrInvalidTargetPath
+	}
+
+	return matches[sourcePathRegexpVolumeIdIndex], nil
 }
