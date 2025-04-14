@@ -4,6 +4,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sort"
+	"strconv"
+	"strings"
+	"sync"
 
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -13,6 +17,7 @@ import (
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
+	"github.com/awslabs/aws-s3-csi-driver/pkg/driver/node/volumecontext"
 	"github.com/awslabs/aws-s3-csi-driver/pkg/podmounter/mppod"
 )
 
@@ -20,10 +25,31 @@ const debugLevel = 4
 
 const mountpointCSIDriverName = "s3.csi.aws.com"
 
+type Expectations struct {
+	pending sync.Map
+}
+
+func NewExpectations() *Expectations {
+	return &Expectations{}
+}
+func (e *Expectations) SetPending(key string) {
+	e.pending.Store(key, struct{}{})
+}
+
+func (e *Expectations) IsPending(key string) bool {
+	_, ok := e.pending.Load(key)
+	return ok
+}
+
+func (e *Expectations) Clear(key string) {
+	e.pending.Delete(key)
+}
+
 // A Reconciler reconciles Mountpoint Pods by watching other workload Pods thats using S3 CSI Driver.
 type Reconciler struct {
-	mountpointPodConfig  mppod.Config
-	mountpointPodCreator *mppod.Creator
+	mountpointPodConfig       mppod.Config
+	mountpointPodCreator      *mppod.Creator
+	mountpointPodExpectations *Expectations
 
 	client.Client
 }
@@ -31,7 +57,7 @@ type Reconciler struct {
 // NewReconciler returns a new reconciler created from `client` and `podConfig`.
 func NewReconciler(client client.Client, podConfig mppod.Config) *Reconciler {
 	creator := mppod.NewCreator(podConfig)
-	return &Reconciler{Client: client, mountpointPodConfig: podConfig, mountpointPodCreator: creator}
+	return &Reconciler{Client: client, mountpointPodExpectations: NewExpectations(), mountpointPodConfig: podConfig, mountpointPodCreator: creator}
 }
 
 // SetupWithManager configures reconciler to run with given `mgr`.
@@ -139,7 +165,8 @@ func (r *Reconciler) reconcileWorkloadPod(ctx context.Context, pod *corev1.Pod) 
 
 		log.V(debugLevel).Info("Found bound PV for PVC", "pvc", pvc.Name, "volumeName", pv.Name)
 
-		err = r.spawnOrDeleteMountpointPodIfNeeded(ctx, pod, pvc, pv, csiSpec)
+		needsRequeue, err := r.spawnOrDeleteMountpointPodIfNeeded(ctx, pod, pvc, pv, csiSpec)
+		requeue = requeue || needsRequeue
 		if err != nil {
 			errs = append(errs, err)
 			continue
@@ -163,57 +190,82 @@ func (r *Reconciler) spawnOrDeleteMountpointPodIfNeeded(
 	pvc *corev1.PersistentVolumeClaim,
 	pv *corev1.PersistentVolume,
 	csiSpec *corev1.CSIPersistentVolumeSource,
-) error {
-	mpPodName := mppod.MountpointPodNameFor(string(workloadPod.UID), pvc.Spec.VolumeName)
-
-	log := logf.FromContext(ctx).WithValues(
-		"workloadPod", types.NamespacedName{Namespace: workloadPod.Namespace, Name: workloadPod.Name},
-		"mountpointPod", mpPodName,
-		"pvc", pvc.Name, "volumeName", pv.Name)
-
-	mpPod := &corev1.Pod{}
-	err := r.Get(ctx, types.NamespacedName{Namespace: r.mountpointPodConfig.Namespace, Name: mpPodName}, mpPod)
-	if err != nil && !apierrors.IsNotFound(err) {
-		log.Error(err, "Failed to get Mountpoint Pod")
-		return err
-	}
-
-	isMountpointPodExists := err == nil
-
+) (bool, error) {
 	// `workloadPod` is not active, its either terminated (i.e., `phase == Succeeded or phase == Failed`) or
 	// its scheduled for termination (i.e., `DeletionTimestamp != nil`)
 	if !isPodActive(workloadPod) {
-		// if its scheduled for termination and its still in `Pending` phase,
-		// delete if there is an existing Mountpoint Pod as otherwise this
-		// Mountpoint Pod might take some time to terminate on its own.
-		if isMountpointPodExists && workloadPod.Status.Phase == corev1.PodPending {
-			log.Info("Deleting scheduled Mountpoint Pod")
-			err := r.deleteMountpointPod(ctx, mpPod)
-			if err != nil {
-				log.Error(err, "Failed to delete scheduled Mountpoint Pod")
-				return err
-			}
+		return false, nil
+	}
 
-			log.Info("Scheduled Mountpoint Pod deleted")
-			return err
+	volumeAttributes := mppod.ExtractVolumeAttributes(pv)
+	authSource := volumeAttributes[volumecontext.AuthenticationSource]
+	if authSource == "" { // TODO: This is duplicate logic with credential provider. We can refactor it.
+		authSource = "driver"
+	}
+	fsGroup := ""
+	if workloadPod.Spec.SecurityContext.FSGroup != nil {
+		fsGroup = strconv.FormatInt(*workloadPod.Spec.SecurityContext.FSGroup, 10)
+	}
+
+	log := logf.FromContext(ctx).WithValues(
+		"workloadPod", types.NamespacedName{Namespace: workloadPod.Namespace, Name: workloadPod.Name},
+		"authSource", authSource,
+		"pvc", pvc.Name, "volumeName", pv.Name)
+
+	mpPodList := &corev1.PodList{}
+	labelFilters := client.MatchingLabels{
+		mppod.LabelVolumeName:           pv.Name,
+		mppod.LabelAuthenticationSource: authSource,
+		mppod.LabelWorkloadPodFSGroup:   fsGroup,
+	}
+
+	if authSource == "pod" {
+		labelFilters[mppod.LabelWorkloadPodNamespace] = workloadPod.Namespace
+		labelFilters[mppod.LabelWorkloadPodServiceAccountName] = workloadPod.Spec.ServiceAccountName
+	}
+	fieldFilters := client.MatchingFields{"spec.nodeName": workloadPod.Spec.NodeName}
+
+	expectKey := deriveKeyFromFilters(labelFilters, workloadPod.Spec.NodeName)
+	err := r.List(ctx, mpPodList, client.InNamespace(r.mountpointPodConfig.Namespace), fieldFilters, labelFilters)
+
+	if err != nil {
+		log.Error(err, "Failed to list Mountpoint Pods")
+		return false, err
+	}
+
+	if len(mpPodList.Items) > 1 {
+		err := fmt.Errorf("found %d Mountpoint Pods on Node %s instead of 1", len(mpPodList.Items), workloadPod.Spec.NodeName)
+		log.Error(err, "Unexpected number of Mountpoint Pods found")
+		return false, err
+	}
+
+	if len(mpPodList.Items) == 1 {
+		log.Info("Mountpoint Pod already exists - ignoring")
+
+		if r.mountpointPodExpectations.IsPending(expectKey) {
+			log.Info("IS_PENDING=TRUE - REMOVE FROM PENDING - " + expectKey)
+			r.mountpointPodExpectations.Clear(expectKey)
 		}
 
-		// No need to do anything - either there was no Mountpoint Pod for `pod` or it was in `Running` state,
-		// so a clean unmount operation will be performed and Mountpoint Pod will cleany exit (and get deleted by `reconcileMountpointPod`).
-		return nil
-	}
+		return false, nil
+	} else {
+		log.Info("Mountpoint Pod does not exist - checking if workload Pod is pending")
+		if r.mountpointPodExpectations.IsPending(expectKey) {
+			log.Info("IS_PENDING=TRUE - DO NOT SPAWN ANOTHER MPPOD - REQUEUE - " + expectKey)
+			return true, nil
+		} else {
+			log.Info("IS_PENDING=FALSE - SPAWN NEW MPPOD - REQUEUE - " + expectKey)
 
-	if isMountpointPodExists {
-		log.V(debugLevel).Info("Mountpoint Pod already exists - ignoring")
-		return nil
-	}
+			if err := r.spawnMountpointPod(ctx, workloadPod, pvc, pv, csiSpec, authSource); err != nil {
+				log.Error(err, "Failed to spawn Mountpoint Pod")
+				return false, err
+			}
+			log.Info("SET PENDING - REQUEUE - " + expectKey)
+			r.mountpointPodExpectations.SetPending(expectKey)
 
-	if err := r.spawnMountpointPod(ctx, workloadPod, pvc, pv, csiSpec, mpPodName); err != nil {
-		log.Error(err, "Failed to spawn Mountpoint Pod")
-		return err
+			return true, nil
+		}
 	}
-
-	return nil
 }
 
 // spawnMountpointPod spawns a new Mountpoint Pod for given `workloadPod` and volume.
@@ -225,30 +277,41 @@ func (r *Reconciler) spawnMountpointPod(
 	pvc *corev1.PersistentVolumeClaim,
 	pv *corev1.PersistentVolume,
 	_ *corev1.CSIPersistentVolumeSource,
-	name string,
+	authSource string,
 ) error {
 	log := logf.FromContext(ctx).WithValues(
 		"workloadPod", types.NamespacedName{Namespace: workloadPod.Namespace, Name: workloadPod.Name},
-		"mountpointPod", name,
+		"authSource", authSource,
 		"pvc", pvc.Name, "volumeName", pv.Name)
 
 	log.Info("Spawning Mountpoint Pod")
 
 	mpPod := r.mountpointPodCreator.Create(workloadPod, pv)
-	if mpPod.Name != name {
-		err := fmt.Errorf("Mountpoint Pod name mismatch %s vs %s", mpPod.Name, name)
-		log.Error(err, "Name mismatch on Mountpoint Pod")
-		return err
-	}
-
 	err := r.Create(ctx, mpPod)
 	if err != nil {
 		log.Error(err, "Failed to create Mountpoint Pod")
 		return err
 	}
 
-	log.Info("Mountpoint Pod spawned", "mountpointPodUID", mpPod.UID)
+	log.Info("Mountpoint Pod spawned", "mountpointPodUID", mpPod.UID, "mountpointPodName", mpPod.Name)
 	return nil
+}
+
+func deriveKeyFromFilters(labelFilters client.MatchingLabels, nodeName string) string {
+	keys := make([]string, 0, len(labelFilters))
+	for k := range labelFilters {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+
+	var sb strings.Builder
+	for _, k := range keys {
+		sb.WriteString(k)
+		sb.WriteString("=")
+		sb.WriteString(labelFilters[k])
+		sb.WriteString(";")
+	}
+	return nodeName + sb.String()
 }
 
 // deleteMountpointPod deletes given `mountpointPod`.

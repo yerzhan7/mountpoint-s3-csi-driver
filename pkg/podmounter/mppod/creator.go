@@ -2,21 +2,26 @@ package mppod
 
 import (
 	"path/filepath"
+	"strconv"
 
 	"github.com/awslabs/aws-s3-csi-driver/pkg/cluster"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/utils/ptr"
 
+	"github.com/awslabs/aws-s3-csi-driver/pkg/driver/node/credentialprovider"
 	"github.com/awslabs/aws-s3-csi-driver/pkg/driver/node/volumecontext"
 )
 
 // Labels populated on spawned Mountpoint Pods.
 const (
-	LabelMountpointVersion = "s3.csi.aws.com/mountpoint-version"
-	LabelPodUID            = "s3.csi.aws.com/pod-uid"
-	LabelVolumeName        = "s3.csi.aws.com/volume-name"
-	LabelCSIDriverVersion  = "s3.csi.aws.com/mounted-by-csi-driver-version"
+	LabelMountpointVersion             = "s3.csi.aws.com/mountpoint-version"
+	LabelCSIDriverVersion              = "s3.csi.aws.com/mounted-by-csi-driver-version"
+	LabelVolumeName                    = "s3.csi.aws.com/volume-name"
+	LabelAuthenticationSource          = "s3.csi.aws.com/authentication-source"
+	LabelWorkloadPodFSGroup            = "s3.csi.aws.com/workload-pod-fsgroup"
+	LabelWorkloadPodNamespace          = "s3.csi.aws.com/workload-pod-namespace"
+	LabelWorkloadPodServiceAccountName = "s3.csi.aws.com/workload-pod-service-account-name"
 )
 
 // A ContainerConfig represents configuration for containers in the spawned Mountpoint Pods.
@@ -51,18 +56,27 @@ func NewCreator(config Config) *Creator {
 // It automatically assigns Mountpoint Pod to `pod`'s node.
 // The name of the Mountpoint Pod is consistently generated from `pod` and `pv` using `MountpointPodNameFor` function.
 func (c *Creator) Create(pod *corev1.Pod, pv *corev1.PersistentVolume) *corev1.Pod {
+	volumeAttributes := ExtractVolumeAttributes(pv)
 	node := pod.Spec.NodeName
-	name := MountpointPodNameFor(string(pod.UID), pv.Name)
+	authSource := volumeAttributes[volumecontext.AuthenticationSource]
+	if authSource == "" { // TODO: This is duplicate logic with credential provider. We can refactor it.
+		authSource = credentialprovider.AuthenticationSourceDriver
+	}
+	fsGroup := ""
+	if pod.Spec.SecurityContext.FSGroup != nil {
+		fsGroup = strconv.FormatInt(*pod.Spec.SecurityContext.FSGroup, 10)
+	}
 
 	mpPod := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      name,
-			Namespace: c.config.Namespace,
+			GenerateName: "mp-",
+			Namespace:    c.config.Namespace,
 			Labels: map[string]string{
-				LabelMountpointVersion: c.config.MountpointVersion,
-				LabelPodUID:            string(pod.UID),
-				LabelVolumeName:        pv.Name,
-				LabelCSIDriverVersion:  c.config.CSIDriverVersion,
+				LabelMountpointVersion:    c.config.MountpointVersion,
+				LabelCSIDriverVersion:     c.config.CSIDriverVersion,
+				LabelVolumeName:           pv.Name,
+				LabelAuthenticationSource: authSource,
+				LabelWorkloadPodFSGroup:   fsGroup,
 			},
 		},
 		Spec: corev1.PodSpec{
@@ -133,7 +147,12 @@ func (c *Creator) Create(pod *corev1.Pod, pv *corev1.PersistentVolume) *corev1.P
 		},
 	}
 
-	volumeAttributes := extractVolumeAttributes(pv)
+	// For Pod-level identity we are attaching extra workload labels as different ServiceAccounts/Namespaces
+	// would require separate MP Pods because they would use different credentials/tokens.
+	if authSource == credentialprovider.AuthenticationSourcePod {
+		mpPod.ObjectMeta.Labels[LabelWorkloadPodNamespace] = pod.Namespace
+		mpPod.ObjectMeta.Labels[LabelWorkloadPodServiceAccountName] = pod.Spec.ServiceAccountName
+	}
 
 	if saName := volumeAttributes[volumecontext.MountpointPodServiceAccountName]; saName != "" {
 		mpPod.Spec.ServiceAccountName = saName
@@ -144,7 +163,7 @@ func (c *Creator) Create(pod *corev1.Pod, pv *corev1.PersistentVolume) *corev1.P
 
 // extractVolumeAttributes extracts volume attributes from given `pv`.
 // It always returns a non-nil map, and it's safe to use even though `pv` doesn't contain any volume attributes.
-func extractVolumeAttributes(pv *corev1.PersistentVolume) map[string]string {
+func ExtractVolumeAttributes(pv *corev1.PersistentVolume) map[string]string {
 	csiSpec := pv.Spec.CSI
 	if csiSpec == nil {
 		return map[string]string{}

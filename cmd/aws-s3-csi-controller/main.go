@@ -7,10 +7,12 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"os"
 
 	corev1 "k8s.io/api/core/v1"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/config"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
@@ -36,11 +38,22 @@ func main() {
 	logf.SetLogger(zap.New())
 
 	log := logf.Log.WithName(csicontroller.Name)
-	client := config.GetConfigOrDie()
+	conf := config.GetConfigOrDie()
 
-	mgr, err := manager.New(client, manager.Options{})
+	mgr, err := manager.New(conf, manager.Options{})
 	if err != nil {
 		log.Error(err, "Failed to create a new manager")
+		os.Exit(1)
+	}
+
+	if err := mgr.GetFieldIndexer().IndexField(context.TODO(), &corev1.Pod{}, "spec.nodeName", func(obj client.Object) []string {
+		nodeName := obj.(*corev1.Pod).Spec.NodeName
+		if nodeName != "" {
+			return []string{nodeName}
+		}
+		return nil
+	}); err != nil {
+		log.Error(err, "Failed to create a nodeName field indexer")
 		os.Exit(1)
 	}
 
@@ -54,7 +67,7 @@ func main() {
 			ImagePullPolicy: corev1.PullPolicy(*mountpointImagePullPolicy),
 		},
 		CSIDriverVersion: version.GetVersion().DriverVersion,
-		ClusterVariant:   cluster.DetectVariant(client, log),
+		ClusterVariant:   cluster.DetectVariant(conf, log),
 	}).SetupWithManager(mgr)
 	if err != nil {
 		log.Error(err, "Failed to create controller")

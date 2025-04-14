@@ -65,6 +65,13 @@ func (pm *PodMounter) mountSyscallDefault(target string, args mountpoint.Args) (
 	return fd, nil
 }
 
+func (pm *PodMounter) bindMountSyscallDefault(source, target string) error {
+	if err := unix.Mount(source, target, "", unix.MS_BIND, ""); err != nil {
+		return fmt.Errorf("failed to bind mount from %s to %s: %v", source, target, err)
+	}
+	return nil
+}
+
 func verifyMountPointStatx(path string) error {
 	var stat unix.Statx_t
 	if err := unix.Statx(unix.AT_FDCWD, path, unix.AT_STATX_FORCE_SYNC, 0, &stat); err != nil {

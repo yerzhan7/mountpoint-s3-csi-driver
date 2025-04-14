@@ -7,6 +7,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"sync"
 	"syscall"
 	"time"
 
@@ -27,6 +28,7 @@ import (
 
 const mountpointPodReadinessTimeout = 10 * time.Second
 const mountpointPodReadinessCheckInterval = 100 * time.Millisecond
+const SourceMountDir = "/var/lib/kubelet/plugins/s3.csi.aws.com/mnt/"
 
 // targetDirPerm is the permission to use while creating target directory if its not exists.
 const targetDirPerm = fs.FileMode(0755)
@@ -35,6 +37,7 @@ const targetDirPerm = fs.FileMode(0755)
 // It returns mounted FUSE file descriptor as a result.
 // This is mainly exposed for testing, in production platform-native function (`mountSyscallDefault`) will be used.
 type mountSyscall func(target string, args mountpoint.Args) (fd int, err error)
+type bindMountSyscall func(source, target string) (err error)
 
 // A PodMounter is a [Mounter] that mounts Mountpoint on pre-created Kubernetes Pod running in the same node.
 type PodMounter struct {
@@ -42,6 +45,7 @@ type PodMounter struct {
 	mount             mount.Interface
 	kubeletPath       string
 	mountSyscall      mountSyscall
+	bindMountSyscall  bindMountSyscall
 	kubernetesVersion string
 	credProvider      *credentialprovider.Provider
 }
@@ -56,6 +60,47 @@ func NewPodMounter(podWatcher *watcher.Watcher, credProvider *credentialprovider
 		mountSyscall:      mountSyscall,
 		kubernetesVersion: kubernetesVersion,
 	}, nil
+}
+
+type MPPodLock struct {
+	mutex    sync.Mutex
+	refCount int
+}
+
+var (
+	mpPodLocks      = make(map[string]*MPPodLock)
+	mpPodLocksMutex sync.Mutex
+)
+
+func getMPPodLock(mpPodUID string) *MPPodLock {
+	mpPodLocksMutex.Lock()
+	defer mpPodLocksMutex.Unlock()
+
+	lock, exists := mpPodLocks[mpPodUID]
+	if !exists {
+		lock = &MPPodLock{refCount: 1}
+		mpPodLocks[mpPodUID] = lock
+	} else {
+		lock.refCount++
+	}
+	return lock
+}
+
+func releaseMPPodLock(mpPodUID string) {
+	mpPodLocksMutex.Lock()
+	defer mpPodLocksMutex.Unlock()
+
+	lock, exists := mpPodLocks[mpPodUID]
+	if !exists {
+		// Should never happen
+		return
+	}
+
+	lock.refCount--
+
+	if lock.refCount <= 0 {
+		delete(mpPodLocks, mpPodUID)
+	}
 }
 
 // Mount mounts the given `bucketName` at the `target` path using provided credential context and Mountpoint arguments.
@@ -75,24 +120,36 @@ func (pm *PodMounter) Mount(ctx context.Context, bucketName string, target strin
 		return fmt.Errorf("Failed to extract volume name from %q: %w", target, err)
 	}
 
-	podID := credentialCtx.PodID
-
 	err = pm.verifyOrSetupMountTarget(target)
 	if err != nil {
 		return fmt.Errorf("Failed to verify target path can be used as a mount point %q: %w", target, err)
 	}
 
-	isMountPoint, err := pm.IsMountPoint(target)
+	isTargetMountPoint, err := pm.IsMountPoint(target)
 	if err != nil {
 		return fmt.Errorf("Could not check if %q is already a mount point: %w", target, err)
 	}
 
 	// TODO: If `target` is a `systemd`-mounted Mountpoint, this would return an error,
 	// but we should still update the credentials for it by calling `credProvider.Provide`.
-	pod, podPath, err := pm.waitForMountpointPod(ctx, podID, volumeName)
+	pod, podPath, err := pm.waitForMountpointPod(ctx, volumeName, credentialCtx)
 	if err != nil {
 		klog.Errorf("Failed to wait for Mountpoint Pod to be ready for %q: %v", target, err)
 		return fmt.Errorf("Failed to wait for Mountpoint Pod to be ready for %q: %w", target, err)
+	}
+	mpPodUID := string(pod.UID)
+
+	mpPodLock := getMPPodLock(mpPodUID)
+	mpPodLock.mutex.Lock()
+	defer func() {
+		mpPodLock.mutex.Unlock()
+		releaseMPPodLock(mpPodUID)
+	}()
+
+	source := SourceMountDir + mpPodUID
+	err = pm.verifyOrSetupMountTarget(source)
+	if err != nil {
+		return fmt.Errorf("Failed to verify source path can be used as a mount point %q: %w", source, err)
 	}
 
 	podCredentialsPath, err := pm.ensureCredentialsDirExists(podPath)
@@ -107,118 +164,165 @@ func (pm *PodMounter) Mount(ctx context.Context, bucketName string, target strin
 	// there is an existing mount point at `target`.
 	credEnv, authenticationSource, err := pm.credProvider.Provide(ctx, credentialCtx)
 	if err != nil {
-		klog.Errorf("Failed to provide credentials for %s: %v\n%s", target, err, pm.helpMessageForGettingMountpointLogs(pod))
-		return fmt.Errorf("Failed to provide credentials for %q: %w\n%s", target, err, pm.helpMessageForGettingMountpointLogs(pod))
+		klog.Errorf("Failed to provide credentials for %s: %v\n%s", target, err, pm.helpMessageForGettingMountpointLogs(mpPodUID))
+		return fmt.Errorf("Failed to provide credentials for %q: %w\n%s", target, err, pm.helpMessageForGettingMountpointLogs(mpPodUID))
 	}
 
-	if isMountPoint {
+	if isTargetMountPoint {
 		klog.V(4).Infof("Target path %q is already mounted", target)
 		return nil
 	}
 
-	env := envprovider.Default()
-	env.Merge(credEnv)
-
-	// Move `--aws-max-attempts` to env if provided
-	if maxAttempts, ok := args.Remove(mountpoint.ArgAWSMaxAttempts); ok {
-		env.Set(envprovider.EnvMaxAttempts, maxAttempts)
-	}
-
-	args.Set(mountpoint.ArgUserAgentPrefix, UserAgent(authenticationSource, pm.kubernetesVersion))
-
-	podMountSockPath := mppod.PathOnHost(podPath, mppod.KnownPathMountSock)
-	podMountErrorPath := mppod.PathOnHost(podPath, mppod.KnownPathMountError)
-
-	klog.V(4).Infof("Mounting %s for %s", target, pod.Name)
-
-	fuseDeviceFD, err := pm.mountSyscallWithDefault(target, args)
+	isSourceMountPoint, err := pm.IsMountPoint(source)
 	if err != nil {
-		klog.Errorf("Failed to mount %s: %v", target, err)
-		return fmt.Errorf("Failed to mount %s: %w", target, err)
+		return fmt.Errorf("Could not check if source %q is already a mount point: %w", source, err)
 	}
 
-	// This will set to false in the success condition. This is set to `true` by default to
-	// ensure we don't leave `target` mounted if Mountpoint is not started to serve requests for it.
-	unmount := true
-	defer func() {
-		if unmount {
-			if err := pm.unmountTarget(target); err != nil {
-				klog.V(4).ErrorS(err, "Failed to unmount mounted target %s\n", target)
-			} else {
-				klog.V(4).Infof("Target %s unmounted successfully\n", target)
-			}
+	if !isSourceMountPoint {
+		env := envprovider.Default()
+		env.Merge(credEnv)
+
+		// Move `--aws-max-attempts` to env if provided
+		if maxAttempts, ok := args.Remove(mountpoint.ArgAWSMaxAttempts); ok {
+			env.Set(envprovider.EnvMaxAttempts, maxAttempts)
 		}
-	}()
 
-	// This function can either fail or successfully send mount options to Mountpoint Pod - in which
-	// Mountpoint Pod will get its own fd referencing the same underlying file description.
-	// In both case we need to close the fd in this process.
-	defer pm.closeFUSEDevFD(fuseDeviceFD)
+		args.Set(mountpoint.ArgUserAgentPrefix, UserAgent(authenticationSource, pm.kubernetesVersion))
 
-	// Remove old mount error file if exists
-	_ = os.Remove(podMountErrorPath)
+		podMountSockPath := mppod.PathOnHost(podPath, mppod.KnownPathMountSock)
+		podMountErrorPath := mppod.PathOnHost(podPath, mppod.KnownPathMountError)
 
-	klog.V(4).Infof("Sending mount options to Mountpoint Pod %s on %s", pod.Name, podMountSockPath)
+		klog.V(4).Infof("Mounting %s for %s", source, pod.Name)
 
-	err = mountoptions.Send(ctx, podMountSockPath, mountoptions.Options{
-		Fd:         fuseDeviceFD,
-		BucketName: bucketName,
-		Args:       args.SortedList(),
-		Env:        env.List(),
-	})
-	if err != nil {
-		klog.Errorf("Failed to send mount option to Mountpoint Pod %s for %s: %v\n%s", pod.Name, target, err, pm.helpMessageForGettingMountpointLogs(pod))
-		return fmt.Errorf("Failed to send mount options to Mountpoint Pod %s for %s: %w\n%s", pod.Name, target, err, pm.helpMessageForGettingMountpointLogs(pod))
+		fuseDeviceFD, err := pm.mountSyscallWithDefault(source, args)
+		if err != nil {
+			klog.Errorf("Failed to mount source %s: %v", source, err)
+			return fmt.Errorf("Failed to mount source %s: %w", source, err)
+		}
+
+		// This will set to false in the success condition. This is set to `true` by default to
+		// ensure we don't leave `source` mounted if Mountpoint is not started to serve requests for it.
+		unmount := true
+		defer func() {
+			if unmount {
+				if err := pm.unmountTarget(source); err != nil {
+					klog.V(4).ErrorS(err, "Failed to unmount mounted source %s\n", source)
+				} else {
+					klog.V(4).Infof("Source %s unmounted successfully\n", source)
+				}
+			}
+		}()
+
+		// This function can either fail or successfully send mount options to Mountpoint Pod - in which
+		// Mountpoint Pod will get its own fd referencing the same underlying file description.
+		// In both case we need to close the fd in this process.
+		defer pm.closeFUSEDevFD(fuseDeviceFD)
+
+		// Remove old mount error file if exists
+		_ = os.Remove(podMountErrorPath)
+
+		klog.V(4).Infof("Sending mount options to Mountpoint Pod %s on %s", pod.Name, podMountSockPath)
+
+		err = mountoptions.Send(ctx, podMountSockPath, mountoptions.Options{
+			Fd:         fuseDeviceFD,
+			BucketName: bucketName,
+			Args:       args.SortedList(),
+			Env:        env.List(),
+		})
+		if err != nil {
+			klog.Errorf("Failed to send mount option to Mountpoint Pod %s for %s: %v\n%s", pod.Name, source, err, pm.helpMessageForGettingMountpointLogs(mpPodUID))
+			return fmt.Errorf("Failed to send mount options to Mountpoint Pod %s for %s: %w\n%s", pod.Name, source, err, pm.helpMessageForGettingMountpointLogs(mpPodUID))
+		}
+
+		err = pm.waitForMount(ctx, source, pod.Name, podMountErrorPath)
+		if err != nil {
+			klog.Errorf("Failed to wait for Mountpoint Pod %s to be ready for %s: %v\n%s", pod.Name, source, err, pm.helpMessageForGettingMountpointLogs(mpPodUID))
+			return fmt.Errorf("Failed to wait for Mountpoint Pod %s to be ready for %s: %w\n%s", pod.Name, source, err, pm.helpMessageForGettingMountpointLogs(mpPodUID))
+		}
+		// Mountpoint successfully started, so don't unmount the filesystem
+		unmount = false
 	}
 
-	err = pm.waitForMount(ctx, target, pod.Name, podMountErrorPath)
+	// BIND FROM SOURCE TO TARGET
+	err = pm.bindMountSyscallWithDefault(source, target)
 	if err != nil {
-		klog.Errorf("Failed to wait for Mountpoint Pod %s to be ready for %s: %v\n%s", pod.Name, target, err, pm.helpMessageForGettingMountpointLogs(pod))
-		return fmt.Errorf("Failed to wait for Mountpoint Pod %s to be ready for %s: %w\n%s", pod.Name, target, err, pm.helpMessageForGettingMountpointLogs(pod))
+		klog.Errorf("Failed to bind mount %s to target %s: %v", source, target, err)
+		return fmt.Errorf("Failed to bind mount %s to target %s: %w", source, target, err)
 	}
 
-	// Mountpoint successfully started, so don't unmount the filesystem
-	unmount = false
 	return nil
 }
 
 // Unmount unmounts the mount point at `target` and cleans all credentials.
 func (pm *PodMounter) Unmount(ctx context.Context, target string, credentialCtx credentialprovider.CleanupContext) error {
-	volumeName, err := pm.volumeNameFromTargetPath(target)
+	source, err := pm.findSourceMountPoint(target)
 	if err != nil {
-		return fmt.Errorf("Failed to extract volume name from %q: %w", target, err)
+		klog.Errorf("Failed to findSourceMountPoint, will perform unmount of bind mount only %q: %v", target, err)
+		err = pm.unmountTarget(target)
+		if err != nil {
+			klog.Errorf("Failed to unmount bind mount %q: %v", target, err)
+			return fmt.Errorf("Failed to unmount bind mount %q: %w", target, err)
+		}
+		return nil
 	}
 
-	podID := credentialCtx.PodID
+	mpPodUID := filepath.Base(source)
+
+	mpPodLock := getMPPodLock(mpPodUID)
+	mpPodLock.mutex.Lock()
+	defer func() {
+		mpPodLock.mutex.Unlock()
+		releaseMPPodLock(mpPodUID)
+	}()
+
+	podPath := pm.podPath(mpPodUID)
 
 	// TODO: If `target` is a `systemd`-mounted Mountpoint, this would return an error,
 	// but we should still unmount it and clean the credentials.
-	pod, podPath, err := pm.waitForMountpointPod(ctx, podID, volumeName)
-	if err != nil {
-		klog.Errorf("Failed to wait for Mountpoint Pod to be ready for %q: %v", target, err)
-		return fmt.Errorf("Failed to wait for Mountpoint Pod for %q: %w", target, err)
-	}
 
 	credentialCtx.WritePath = pm.credentialsDir(podPath)
 
-	// Write `mount.exit` file to indicate Mountpoint Pod to cleanly exit.
-	podMountExitPath := mppod.PathOnHost(podPath, mppod.KnownPathMountExit)
-	_, err = os.OpenFile(podMountExitPath, os.O_RDONLY|os.O_CREATE, credentialprovider.CredentialFilePerm)
-	if err != nil {
-		klog.Errorf("Failed to send a exit message to Mountpoint Pod for %q: %s\n%s", target, err, pm.helpMessageForGettingMountpointLogs(pod))
-		return fmt.Errorf("Failed to send a exit message to Mountpoint Pod for %q: %w\n%s", target, err, pm.helpMessageForGettingMountpointLogs(pod))
-	}
-
 	err = pm.unmountTarget(target)
 	if err != nil {
-		klog.Errorf("Failed to unmount %q: %v", target, err)
-		return fmt.Errorf("Failed to unmount %q: %w", target, err)
+		klog.Errorf("Failed to unmount bind mount %q: %v", target, err)
+		return fmt.Errorf("Failed to unmount bind mount %q: %w", target, err)
 	}
 
-	err = pm.credProvider.Cleanup(credentialCtx)
+	bindMountCount, err := pm.bindMountCount(source, target)
 	if err != nil {
-		klog.Errorf("Failed to clean up credentials for %s: %v\n%s", target, err, pm.helpMessageForGettingMountpointLogs(pod))
-		return fmt.Errorf("Failed to clean up credentials for %q: %w\n%s", target, err, pm.helpMessageForGettingMountpointLogs(pod))
+		klog.Errorf("Failed to bindMountCount %q: %v", source, err)
+		return fmt.Errorf("Failed to bindMountCount %q: %w", source, err)
+	}
+
+	if bindMountCount == 0 {
+		klog.Infof("BIND MOUNT COUNT: %d - UNMOUNTING SOURCE - %s", bindMountCount, source)
+		// Write `mount.exit` file to indicate Mountpoint Pod to cleanly exit.
+		podMountExitPath := mppod.PathOnHost(podPath, mppod.KnownPathMountExit)
+		_, err = os.OpenFile(podMountExitPath, os.O_RDONLY|os.O_CREATE, credentialprovider.CredentialFilePerm)
+		if err != nil {
+			klog.Errorf("Failed to send a exit message to Mountpoint Pod for %q: %s\n%s", source, err, pm.helpMessageForGettingMountpointLogs(mpPodUID))
+			return fmt.Errorf("Failed to send a exit message to Mountpoint Pod for %q: %w\n%s", source, err, pm.helpMessageForGettingMountpointLogs(mpPodUID))
+		}
+
+		err = pm.unmountTarget(source)
+		if err != nil {
+			klog.Errorf("Failed to unmount source %q: %v", source, err)
+			return fmt.Errorf("Failed to unmount source %q: %w", source, err)
+		}
+
+		err = os.Remove(source)
+		if err != nil {
+			klog.Errorf("Failed to remove source directory %q: %v", source, err)
+			return fmt.Errorf("Failed to remove source directory %q: %w", source, err)
+		}
+
+		err = pm.credProvider.Cleanup(credentialCtx)
+		if err != nil {
+			klog.Errorf("Failed to clean up credentials for %s: %v\n%s", source, err, pm.helpMessageForGettingMountpointLogs(mpPodUID))
+			return fmt.Errorf("Failed to clean up credentials for %q: %w\n%s", source, err, pm.helpMessageForGettingMountpointLogs(mpPodUID))
+		}
+	} else {
+		klog.Infof("BIND MOUNT COUNT: %d", bindMountCount)
 	}
 
 	return nil
@@ -230,19 +334,25 @@ func (pm *PodMounter) IsMountPoint(target string) (bool, error) {
 	return isMountPoint(pm.mount, target)
 }
 
-// waitForMountpointPod waints until Mountpoint Pod for given `podID` and `volumeName` is in `Running` state.
-// It returns found Mountpoint Pod and it's base directory.
-func (pm *PodMounter) waitForMountpointPod(ctx context.Context, podID, volumeName string) (*corev1.Pod, string, error) {
-	podName := mppod.MountpointPodNameFor(podID, volumeName)
+func (pm *PodMounter) findSourceMountPoint(target string) (string, error) {
+	return findSourceMountPoint(pm.mount, target)
+}
 
-	pod, err := pm.podWatcher.Wait(ctx, podName)
+func (pm *PodMounter) bindMountCount(source, target string) (int, error) {
+	return bindMountCount(pm.mount, source, target)
+}
+
+// waitForMountpointPod waits until Mountpoint Pod for given `podID` and `volumeName` is in `Running` state.
+// It returns found Mountpoint Pod and it's base directory.
+func (pm *PodMounter) waitForMountpointPod(ctx context.Context, volumeName string, credentialCtx credentialprovider.ProvideContext) (*corev1.Pod, string, error) {
+	pod, err := pm.podWatcher.Wait(ctx, volumeName, credentialCtx)
 	if err != nil {
 		return nil, "", err
 	}
 
-	klog.V(4).Infof("Mountpoint Pod %s/%s is running with id %s", pod.Namespace, podName, pod.UID)
+	klog.V(4).Infof("Mountpoint Pod %s/%s is running with id %s", pod.Namespace, pod.Name, pod.UID)
 
-	return pod, pm.podPath(pod), nil
+	return pod, pm.podPath(string(pod.UID)), nil
 }
 
 // waitForMount waits until Mountpoint is successfully mounted at `target`.
@@ -348,8 +458,8 @@ func (pm *PodMounter) credentialsDir(podPath string) string {
 }
 
 // podPath returns `pod`'s basepath inside kubelet's path.
-func (pm *PodMounter) podPath(pod *corev1.Pod) string {
-	return filepath.Join(pm.kubeletPath, "pods", string(pod.UID))
+func (pm *PodMounter) podPath(podUID string) string {
+	return filepath.Join(pm.kubeletPath, "pods", podUID)
 }
 
 // mountSyscallWithDefault delegates to `mountSyscall` if set, or fallbacks to platform-native `mountSyscallDefault`.
@@ -359,6 +469,15 @@ func (pm *PodMounter) mountSyscallWithDefault(target string, args mountpoint.Arg
 	}
 
 	return pm.mountSyscallDefault(target, args)
+}
+
+// bindMountWithDefault delegates to `bindMountSyscall` if set, or fallbacks to platform-native `mountSyscallDefault`.
+func (pm *PodMounter) bindMountSyscallWithDefault(source, target string) error {
+	if pm.bindMountSyscall != nil {
+		return pm.bindMountSyscall(source, target)
+	}
+
+	return pm.bindMountSyscallDefault(source, target)
 }
 
 // unmountTarget calls `unmount` syscall on `target`.
@@ -375,6 +494,6 @@ func (pm *PodMounter) volumeNameFromTargetPath(target string) (string, error) {
 	return tp.VolumeID, nil
 }
 
-func (pm *PodMounter) helpMessageForGettingMountpointLogs(pod *corev1.Pod) string {
-	return fmt.Sprintf("You can see Mountpoint logs by running: `kubectl logs -n %s %s`. If the Mountpoint Pod already restarted, you can also pass `--previous` to get logs from the previous run.", pod.Namespace, pod.Name)
+func (pm *PodMounter) helpMessageForGettingMountpointLogs(pod string) string {
+	return fmt.Sprintf("You can see Mountpoint logs by running: `kubectl logs -n  %s`. If the Mountpoint Pod already restarted, you can also pass `--previous` to get logs from the previous run.", pod)
 }

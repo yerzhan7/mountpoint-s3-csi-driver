@@ -117,6 +117,7 @@ func provideLongTermCredentialsFromDriver(provideCtx ProvideContext, accessKeyID
 
 // driverLevelLongTermCredentialsProfilePrefix generates a prefix for AWS credential profile names
 // when using driver-level authentication. The prefix includes both pod and volume IDs to ensure uniqueness.
+// TODO: NEEDS TO BE UPDATED WITH POD SHARING?
 func driverLevelLongTermCredentialsProfilePrefix(podID, volumeID string) string {
 	return escapedVolumeIdentifier(podID, volumeID) + "-"
 }

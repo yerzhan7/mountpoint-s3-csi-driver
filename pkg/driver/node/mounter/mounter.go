@@ -5,6 +5,8 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"strings"
+	"syscall"
 
 	"k8s.io/klog/v2"
 	"k8s.io/mount-utils"
@@ -64,4 +66,69 @@ func isMountPoint(mounter mount.Interface, target string) (bool, error) {
 		}
 	}
 	return false, nil
+}
+
+func findSourceMountPoint(mounter mount.Interface, target string) (string, error) {
+	targetStat, err := os.Stat(target)
+	if err != nil {
+		return "", fmt.Errorf("error stating %s: %v", target, err)
+	}
+
+	targetStatSys := targetStat.Sys().(*syscall.Stat_t)
+	targetDevice := targetStatSys.Dev
+	targetInode := targetStatSys.Ino
+
+	mountPoints, err := mounter.List()
+	if err != nil {
+		return "", fmt.Errorf("failed to list mounts: %w", err)
+	}
+	for _, mp := range mountPoints {
+		if mp.Device == mountpointDeviceName && strings.HasPrefix(mp.Path, SourceMountDir) {
+			mpPathStatSys, err := os.Stat(mp.Path)
+			if err != nil {
+				klog.V(4).Infof("ignoring s3-mountpoint '%s' during findSourceMountPoint as it failed to stat: %q", mp.Path, err)
+				continue
+			}
+
+			mpPathStat := mpPathStatSys.Sys().(*syscall.Stat_t)
+
+			if targetDevice == mpPathStat.Dev && targetInode == mpPathStat.Ino {
+				return mp.Path, nil
+			}
+		}
+	}
+	return "", fmt.Errorf("failed to find source mount %s", target)
+}
+
+func bindMountCount(mounter mount.Interface, source, target string) (int, error) {
+	counter := 0
+	sourceStat, err := os.Stat(source)
+	if err != nil {
+		return counter, fmt.Errorf("error stating %s: %v", source, err)
+	}
+
+	sourceStatSys := sourceStat.Sys().(*syscall.Stat_t)
+	sourceDevice := sourceStatSys.Dev
+	sourceInode := sourceStatSys.Ino
+
+	mountPoints, err := mounter.List()
+	if err != nil {
+		return counter, fmt.Errorf("Failed to list mounts: %w", err)
+	}
+	for _, mp := range mountPoints {
+		if mp.Device == mountpointDeviceName && !strings.HasPrefix(mp.Path, SourceMountDir) && mp.Path != source && mp.Path != target {
+			mpPathStatSys, err := os.Stat(mp.Path)
+			if err != nil {
+				klog.V(4).Infof("ignoring s3-mountpoint '%s' during bind mount count as it failed to stat: %q", mp.Path, err)
+				continue
+			}
+
+			mpPathStat := mpPathStatSys.Sys().(*syscall.Stat_t)
+
+			if sourceDevice == mpPathStat.Dev && sourceInode == mpPathStat.Ino {
+				counter++
+			}
+		}
+	}
+	return counter, nil
 }

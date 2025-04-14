@@ -61,6 +61,9 @@ type ProvideContext struct {
 	PodID    string
 	VolumeID string
 
+	// TODO: Refactor as fsGroup has nothing to do with credentials
+	FSGroup string
+
 	// The following values are provided from CSI volume context.
 	AuthenticationSource AuthenticationSource
 	PodNamespace         string

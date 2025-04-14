@@ -5,15 +5,19 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"sync/atomic"
 	"time"
 
+	"github.com/awslabs/aws-s3-csi-driver/pkg/driver/node/credentialprovider"
+	"github.com/awslabs/aws-s3-csi-driver/pkg/podmounter/mppod"
 	corev1 "k8s.io/api/core/v1"
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes"
 	listerv1 "k8s.io/client-go/listers/core/v1"
 	"k8s.io/client-go/tools/cache"
+	"k8s.io/klog/v2"
 )
 
 // ErrPodNotFound returned when the Mountpoint Pod could not be found in the cluster.
@@ -52,14 +56,15 @@ func (w *Watcher) Start(stopCh <-chan struct{}) error {
 }
 
 // Wait blocks until the specified Mountpoint Pod is found and ready, or until the context is cancelled.
-func (w *Watcher) Wait(ctx context.Context, name string) (*corev1.Pod, error) {
+func (w *Watcher) Wait(ctx context.Context, volumeName string, credentialCtx credentialprovider.ProvideContext) (*corev1.Pod, error) {
 	// Set a watcher for Pod create & update events
 	var podFound atomic.Bool
 	podChan := make(chan *corev1.Pod, 1)
 	handle, err := w.informer.AddEventHandler(cache.ResourceEventHandlerFuncs{
 		AddFunc: func(obj any) {
 			pod := obj.(*corev1.Pod)
-			if pod.Name == name {
+			if isAssignedMpPod(pod, volumeName, credentialCtx) {
+				klog.V(4).Infof("Found MP Pod from Add event informer")
 				podFound.Store(true)
 				if w.isPodReady(pod) {
 					podChan <- pod
@@ -68,7 +73,8 @@ func (w *Watcher) Wait(ctx context.Context, name string) (*corev1.Pod, error) {
 		},
 		UpdateFunc: func(old, new any) {
 			pod := new.(*corev1.Pod)
-			if pod.Name == name {
+			if isAssignedMpPod(pod, volumeName, credentialCtx) {
+				klog.V(4).Infof("Found MP Pod from Update event informer")
 				podFound.Store(true)
 				if w.isPodReady(pod) {
 					podChan <- pod
@@ -77,25 +83,44 @@ func (w *Watcher) Wait(ctx context.Context, name string) (*corev1.Pod, error) {
 		},
 	})
 	if err != nil {
-		return nil, fmt.Errorf("failed to add event handler for %s: %w", name, err)
+		return nil, fmt.Errorf("failed to add event handler for %s: %w", volumeName, err)
 	}
 
 	// Ensure to remove event handler at the end
 	defer w.informer.RemoveEventHandler(handle)
 
 	// Check if the Pod already exists
-	pod, err := w.lister.Get(name)
-	if err == nil {
-		podFound.Store(true)
-		if w.isPodReady(pod) {
-			// Pod already exists and ready
-			return pod, nil
+	labelSelector := labels.Set{
+		mppod.LabelVolumeName:           volumeName,
+		mppod.LabelAuthenticationSource: credentialprovider.AuthenticationSourceDriver,
+		mppod.LabelWorkloadPodFSGroup:   credentialCtx.FSGroup,
+	}
+	if credentialCtx.AuthenticationSource == credentialprovider.AuthenticationSourcePod {
+		labelSelector[mppod.LabelAuthenticationSource] = credentialprovider.AuthenticationSourcePod
+		labelSelector[mppod.LabelWorkloadPodNamespace] = credentialCtx.PodNamespace
+		labelSelector[mppod.LabelWorkloadPodServiceAccountName] = credentialCtx.ServiceAccountName
+	}
+	pods, err := w.lister.List(labelSelector.AsSelector())
+	if err != nil {
+		return nil, fmt.Errorf("failed to list pods %s: %w", volumeName, err)
+	}
+
+	var podsOnCurrentNode []*corev1.Pod
+	for _, pod := range pods {
+		if pod.Spec.NodeName == os.Getenv("CSI_NODE_NAME") {
+			podsOnCurrentNode = append(podsOnCurrentNode, pod)
 		}
 	}
 
-	if err != nil && !apierrors.IsNotFound(err) {
-		// We got a different error than "not found", just propagate it
-		return nil, fmt.Errorf("failed to get pod %s: %w", name, err)
+	if len(podsOnCurrentNode) == 1 {
+		podFound.Store(true)
+		klog.V(4).Infof("Found MP Pod from cache")
+		if w.isPodReady(podsOnCurrentNode[0]) {
+			// Pod already exists and ready
+			return podsOnCurrentNode[0], nil
+		}
+	} else if len(podsOnCurrentNode) > 1 {
+		return nil, fmt.Errorf("found %d MP Pods instead of 1", len(podsOnCurrentNode))
 	}
 
 	// Pod does not exists or not ready yet. We set a watcher for create & update events,
@@ -113,6 +138,36 @@ func (w *Watcher) Wait(ctx context.Context, name string) (*corev1.Pod, error) {
 		}
 
 		return nil, ErrPodNotFound
+	}
+}
+
+func isAssignedMpPod(mpPod *corev1.Pod, volumeName string, credentialCtx credentialprovider.ProvideContext) bool {
+	if mpPod.Spec.NodeName != os.Getenv("CSI_NODE_NAME") {
+		return false
+	}
+	labels := mpPod.Labels
+	switch credentialCtx.AuthenticationSource {
+	case credentialprovider.AuthenticationSourceUnspecified, credentialprovider.AuthenticationSourceDriver:
+		if labels[mppod.LabelVolumeName] == volumeName &&
+			labels[mppod.LabelWorkloadPodFSGroup] == credentialCtx.FSGroup &&
+			labels[mppod.LabelAuthenticationSource] == credentialprovider.AuthenticationSourceDriver {
+			return true
+		} else {
+			return false
+		}
+	case credentialprovider.AuthenticationSourcePod:
+		if labels[mppod.LabelVolumeName] == volumeName &&
+			labels[mppod.LabelWorkloadPodFSGroup] == credentialCtx.FSGroup &&
+			labels[mppod.LabelAuthenticationSource] == credentialCtx.AuthenticationSource &&
+			labels[mppod.LabelWorkloadPodNamespace] == credentialCtx.PodNamespace &&
+			labels[mppod.LabelWorkloadPodServiceAccountName] == credentialCtx.ServiceAccountName {
+			return true
+		} else {
+			return false
+		}
+	default:
+		klog.V(4).Infof("Unknown AuthenticationSource: %s", credentialCtx.AuthenticationSource)
+		return false
 	}
 }
 

@@ -201,7 +201,7 @@ func (ns *S3NodeServer) NodeExpandVolume(ctx context.Context, req *csi.NodeExpan
 }
 
 func (ns *S3NodeServer) NodeGetCapabilities(ctx context.Context, req *csi.NodeGetCapabilitiesRequest) (*csi.NodeGetCapabilitiesResponse, error) {
-	klog.V(4).Infof("NodeGetCapabilities: called with args %+v", req)
+	// klog.V(4).Infof("NodeGetCapabilities: called with args %+v", req)
 	var caps []*csi.NodeServiceCapability
 	var nodeCaps []csi.NodeServiceCapability_RPC_Type
 	if util.UsePodMounter() {
@@ -223,7 +223,7 @@ func (ns *S3NodeServer) NodeGetCapabilities(ctx context.Context, req *csi.NodeGe
 }
 
 func (ns *S3NodeServer) NodeGetInfo(ctx context.Context, req *csi.NodeGetInfoRequest) (*csi.NodeGetInfoResponse, error) {
-	klog.V(4).Infof("NodeGetInfo: called with args %+v", req)
+	// klog.V(4).Infof("NodeGetInfo: called with args %+v", req)
 
 	return &csi.NodeGetInfoResponse{
 		NodeId: ns.NodeID,
@@ -259,9 +259,16 @@ func credentialProvideContextFromPublishRequest(req *csi.NodePublishVolumeReques
 
 	bucketRegion, _ := args.Value(mountpoint.ArgRegion)
 
+	// TODO: Refactor as fsGroup has nothing to do with credentials
+	fsGroup := ""
+	if req.VolumeCapability.GetMount() != nil {
+		fsGroup = req.VolumeCapability.GetMount().GetVolumeMountGroup()
+	}
+
 	return credentialprovider.ProvideContext{
 		PodID:                podID,
 		VolumeID:             req.GetVolumeId(),
+		FSGroup:              fsGroup,
 		AuthenticationSource: volumeCtx[volumecontext.AuthenticationSource],
 		PodNamespace:         volumeCtx[volumecontext.CSIPodNamespace],
 		ServiceAccountTokens: volumeCtx[volumecontext.CSIServiceAccountTokens],
