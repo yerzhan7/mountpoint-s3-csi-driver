@@ -6,6 +6,13 @@ kubeVersion: ">=1.25.0-0"
 home: https://github.com/awslabs/mountpoint-s3-csi-driver
 sources:
   - https://github.com/awslabs/mountpoint-s3-csi-driver
+# TODO: Remove this and ask customers to install and configure this themselves if they want dynamic provisioning
+# as they potentially may want to install multiple instances of this chart for different 
+# namespaces with different regions/aws accounts/credentials
+dependencies:
+  - name: s3-chart
+    version: 1.0.30
+    repository: oci://public.ecr.aws/aws-controllers-k8s
 keywords:
   - aws
   - mountpoint

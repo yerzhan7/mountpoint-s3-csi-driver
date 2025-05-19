@@ -5,6 +5,7 @@ const (
 	BucketName           = "bucketName"
 	AuthenticationSource = "authenticationSource"
 	STSRegion            = "stsRegion"
+	VolumePathPrefix     = "volumePathPrefix"
 
 	MountpointPodServiceAccountName = "mountpointPodServiceAccountName"
 

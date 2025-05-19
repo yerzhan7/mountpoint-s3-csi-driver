@@ -147,6 +147,17 @@ func (ns *S3NodeServer) NodePublishVolume(ctx context.Context, req *csi.NodePubl
 		args.SetIfAbsent(mountpoint.ArgAllowRoot, mountpoint.ArgNoValue)
 	}
 
+	// Handle VolumePathPrefix if it exists in volumeCtx
+	if VolumePathPrefix, ok := volumeCtx[volumecontext.VolumePathPrefix]; ok && VolumePathPrefix != "" {
+		if existingPrefix, exists := args.Value(mountpoint.ArgPrefix); exists && existingPrefix != "" {
+			// Prepend VolumePathPrefix to the existing prefix
+			args.Set(mountpoint.ArgPrefix, VolumePathPrefix+existingPrefix)
+		} else {
+			// Create new prefix argument with VolumePathPrefix
+			args.Set(mountpoint.ArgPrefix, VolumePathPrefix)
+		}
+	}
+
 	klog.V(4).Infof("NodePublishVolume: mounting %s at %s with options %v", bucket, target, args.SortedList())
 
 	credentialCtx := credentialProvideContextFromPublishRequest(req, args)

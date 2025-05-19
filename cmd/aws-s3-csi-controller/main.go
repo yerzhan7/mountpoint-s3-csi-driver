@@ -7,9 +7,12 @@
 package main
 
 import (
+	"context"
 	"flag"
+	"net"
 	"os"
 
+	"google.golang.org/grpc"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
@@ -20,13 +23,16 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/manager"
 	"sigs.k8s.io/controller-runtime/pkg/manager/signals"
 
+	s3v1alpha1 "github.com/aws-controllers-k8s/s3-controller/apis/v1alpha1"
 	"github.com/awslabs/aws-s3-csi-driver/cmd/aws-s3-csi-controller/csicontroller"
 	crdv1beta "github.com/awslabs/aws-s3-csi-driver/pkg/api/v1beta"
 	"github.com/awslabs/aws-s3-csi-driver/pkg/cluster"
 	"github.com/awslabs/aws-s3-csi-driver/pkg/driver/version"
 	"github.com/awslabs/aws-s3-csi-driver/pkg/podmounter/mppod"
+	"github.com/container-storage-interface/spec/lib/go/csi"
 )
 
+var csiEndpoint = flag.String("csi-endpoint", os.Getenv("CSI_ENDPOINT"), "Unix socket path for CSI Driver to listen.")
 var mountpointNamespace = flag.String("mountpoint-namespace", os.Getenv("MOUNTPOINT_NAMESPACE"), "Namespace to spawn Mountpoint Pods in.")
 var mountpointVersion = flag.String("mountpoint-version", os.Getenv("MOUNTPOINT_VERSION"), "Version of Mountpoint within the given Mountpoint image.")
 var mountpointPriorityClassName = flag.String("mountpoint-priority-class-name", os.Getenv("MOUNTPOINT_PRIORITY_CLASS_NAME"), "Priority class name of the Mountpoint Pods.")
@@ -41,6 +47,7 @@ var (
 func init() {
 	utilruntime.Must(clientgoscheme.AddToScheme(scheme))
 	utilruntime.Must(crdv1beta.AddToScheme(scheme))
+	utilruntime.Must(s3v1alpha1.AddToScheme(scheme))
 }
 
 func main() {
@@ -86,6 +93,36 @@ func main() {
 		log.Error(err, "Failed to add stale attachment cleaner to manager")
 		os.Exit(1)
 	}
+
+	// TODO: Move this to separate controller and not interfere with existing Reconciler/PodAttachment controller
+	controller := &csicontroller.Controller{
+		Client: mgr.GetClient(),
+	}
+	server := grpc.NewServer(grpc.UnaryInterceptor(func(ctx context.Context, req any, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (any, error) {
+		log.Info("Incoming requests", "req", req)
+		resp, err := handler(ctx, req)
+		if err != nil {
+			log.Error(err, "handler error")
+		}
+		log.Info("Response", "resp", resp)
+		return resp, err
+	}))
+	csi.RegisterIdentityServer(server, controller)
+	csi.RegisterControllerServer(server, controller)
+
+	listener, err := net.Listen("unix", *csiEndpoint)
+	if err != nil {
+		log.Error(err, "Failed to listen CSI endpoint")
+		os.Exit(1)
+	}
+
+	go func() {
+		log.Info("Starting CSI server", "endpoint", *csiEndpoint)
+		err := server.Serve(listener)
+		if err != nil {
+			log.Error(err, "Failed to serve CSI server")
+		}
+	}()
 
 	if err := mgr.Start(signals.SetupSignalHandler()); err != nil {
 		log.Error(err, "Failed to start manager")

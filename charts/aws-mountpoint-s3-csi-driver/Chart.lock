@@ -1,0 +1,6 @@
+dependencies:
+- name: s3-chart
+  repository: oci://public.ecr.aws/aws-controllers-k8s
+  version: 1.0.30
+digest: sha256:322cbf6c497c153af4ec751e75ac4724740dbbc29da1d2f8ae3a205fd0f97410
+generated: "2025-05-15T15:03:39.054816+01:00"

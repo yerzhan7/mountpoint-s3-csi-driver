@@ -189,7 +189,6 @@ func (d *Driver) Run() error {
 	d.Srv = grpc.NewServer(opts...)
 
 	csi.RegisterIdentityServer(d.Srv, d)
-	csi.RegisterControllerServer(d.Srv, d)
 	csi.RegisterNodeServer(d.Srv, d.NodeServer)
 
 	klog.Infof("Listening for connections on address: %#v", listener.Addr())

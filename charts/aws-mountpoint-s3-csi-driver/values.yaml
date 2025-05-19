@@ -111,3 +111,7 @@ eksPodIdentityAgent:
 
 experimental:
   podMounter: false
+
+s3-chart:
+  aws:
+    region: us-east-1
