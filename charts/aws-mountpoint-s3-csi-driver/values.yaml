@@ -109,5 +109,10 @@ awsAccessSecret:
 eksPodIdentityAgent:
   containerCredentialsFullURI: "http://169.254.170.23/v1/credentials"
 
+# CSI Driver v2 only: If enabled CSI Driver will continue supporting S3 CSI Driver volumes that were mounted by v1 version (SystemD mounts).
+# You can set it to false if you've migrated all your S3 volumes in the cluster to CSI Driver v2
+# TODO: Remove this in v3
+supportLegacySystemDMounts: true
+
 experimental:
   podMounter: false

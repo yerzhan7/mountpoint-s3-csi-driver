@@ -21,6 +21,7 @@ import (
 	"github.com/awslabs/aws-s3-csi-driver/pkg/driver/node/credentialprovider"
 	"github.com/awslabs/aws-s3-csi-driver/pkg/driver/node/volumecontext"
 	"github.com/awslabs/aws-s3-csi-driver/pkg/podmounter/mppod"
+	"github.com/awslabs/aws-s3-csi-driver/pkg/util"
 	"github.com/go-logr/logr"
 )
 
@@ -158,7 +159,7 @@ func (r *Reconciler) reconcileWorkloadPod(ctx context.Context, pod *corev1.Pod) 
 
 		log.V(debugLevel).Info("Found bound PV for PVC", "pvc", pvc.Name, "volumeName", pv.Name)
 
-		needsRequeue, err := r.spawnOrDeleteMountpointPodIfNeeded(ctx, pod, pvc, pv, csiSpec)
+		needsRequeue, err := r.spawnOrDeleteMountpointPodIfNeeded(ctx, pod, pvc, pv)
 		requeue = requeue || needsRequeue
 		if err != nil {
 			errs = append(errs, err)
@@ -182,7 +183,6 @@ func (r *Reconciler) spawnOrDeleteMountpointPodIfNeeded(
 	workloadPod *corev1.Pod,
 	pvc *corev1.PersistentVolumeClaim,
 	pv *corev1.PersistentVolume,
-	csiSpec *corev1.CSIPersistentVolumeSource,
 ) (bool, error) {
 	workloadUID := string(workloadPod.UID)
 	roleArn, err := r.findIRSAServiceAccountRole(ctx, workloadPod)
@@ -359,6 +359,10 @@ func (r *Reconciler) addWorkloadToS3PodAttachment(
 
 	// There is no suitable Mountpoint Pod for the workload, we need to create a new one
 	mpPod, err := r.spawnMountpointPod(ctx, workloadPod, pv, log)
+	if err == nil {
+		log.Error(err, "Failed to spawn Mountpoint Pod")
+		return Requeue, err
+	}
 	s3pa.Spec.MountpointS3PodAttachments[mpPod.Name] = []crdv1beta.WorkloadAttachment{
 		{
 			WorkloadPodUID: string(workloadPod.UID),
@@ -527,6 +531,12 @@ func (r *Reconciler) handleNewS3PodAttachment(
 	if r.s3paExpectations.isPending(fieldFilters) {
 		log.Info("MountpointS3PodAttachment creation is pending, requeuing")
 		return Requeue, nil
+	}
+
+	if util.SupportLegacySystemdMounts() && isPodRunning(workloadPod) {
+		log.Info("Workload pod is already in Running phase and MountpointS3PodAttachment does not exist. " +
+			"Assuming pod is using legacy systemd mountpoint from CSI Driver v1. Skipping creation of MountpointS3PodAttachment and Mountpoint Pod.")
+		return DontRequeue, nil
 	}
 
 	if err := r.createS3PodAttachmentWithMPPod(ctx, workloadPod, pv, roleArn, log); err != nil {
@@ -791,6 +801,11 @@ func isPodActive(p *corev1.Pod) bool {
 	return corev1.PodSucceeded != p.Status.Phase &&
 		corev1.PodFailed != p.Status.Phase &&
 		p.DeletionTimestamp == nil
+}
+
+// isPodRunning returns whether given Pod phase is `Running`.
+func isPodRunning(p *corev1.Pod) bool {
+	return p.Status.Phase == corev1.PodRunning
 }
 
 // s3paContainsWorkload checks whether MountpointS3PodAttachment has `workloadUID` in it.

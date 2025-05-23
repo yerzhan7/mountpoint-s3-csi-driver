@@ -70,5 +70,7 @@ spec:
               value: {{ .Values.mountpointPod.namespace }}
             - name: MOUNTPOINT_PRIORITY_CLASS_NAME
               value: {{ .Values.mountpointPod.priorityClassName }}
+            - name: SUPPORT_LEGACY_SYSTEMD_MOUNTS
+              value: "{{ .Values.supportLegacySystemDMounts }}"
 
 {{- end -}}
