@@ -2,8 +2,7 @@ name: Update Sidecar Images
 
 on:
   schedule:
-    # Run every Monday at 9:00 AM UTC
-    - cron: '0 9 * * 1'
+    - cron: '0 0 * * 1' # Run every Monday at 00:00 UTC
   workflow_dispatch: # Allow manual trigger
 
 permissions:
@@ -16,11 +15,6 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
-
-      - name: Install yq
-        run: |
-          sudo wget -qO /usr/local/bin/yq https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64
-          sudo chmod +x /usr/local/bin/yq
 
       - name: Update node-driver-registrar image tag
         run: |
