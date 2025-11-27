@@ -299,7 +299,7 @@ func (r *Reconciler) spawnOrDeleteMountpointPodIfNeeded(
 	log := r.setupLogger(ctx, workloadPod, pvc, workloadUID, fieldFilters, s3pa)
 
 	if !isPodActive(workloadPod) {
-		return r.handleInactivePod(ctx, s3pa, workloadUID, log)
+		return r.handleInactivePod(ctx, s3pa, workloadUID, fieldFilters, log)
 	}
 
 	if s3pa != nil {
@@ -406,13 +406,13 @@ func (r *Reconciler) getExistingS3PodAttachment(ctx context.Context, fieldFilter
 }
 
 // handleInactivePod handles inactive workload pod.
-func (r *Reconciler) handleInactivePod(ctx context.Context, s3pa *crdv2.MountpointS3PodAttachment, workloadUID string, log logr.Logger) (bool, error) {
+func (r *Reconciler) handleInactivePod(ctx context.Context, s3pa *crdv2.MountpointS3PodAttachment, workloadUID string, fieldFilters client.MatchingFields, log logr.Logger) (bool, error) {
 	if s3pa == nil {
 		log.Info("Workload pod is not active. Did not find any MountpointS3PodAttachments.")
 		return DontRequeue, nil
 	}
 
-	return r.removeWorkloadFromS3PodAttachment(ctx, s3pa, workloadUID, log)
+	return r.removeWorkloadFromS3PodAttachment(ctx, s3pa, workloadUID, fieldFilters, log)
 }
 
 // handleExistingS3PodAttachment handles existing S3 Pod Attachment.
@@ -552,7 +552,7 @@ func (r *Reconciler) assignWorkloadToAnExistingMountpointPod(ctx context.Context
 
 // removeWorkloadFromS3PodAttachment removes workload UID from MountpointS3PodAttachment map.
 // It will delete MountpointS3PodAttachment if map becomes empty.
-func (r *Reconciler) removeWorkloadFromS3PodAttachment(ctx context.Context, s3pa *crdv2.MountpointS3PodAttachment, workloadUID string, log logr.Logger) (bool, error) {
+func (r *Reconciler) removeWorkloadFromS3PodAttachment(ctx context.Context, s3pa *crdv2.MountpointS3PodAttachment, workloadUID string, fieldFilters client.MatchingFields, log logr.Logger) (bool, error) {
 	// Remove workload UID from mountpoint pods
 	for mpPodName, attachments := range s3pa.Spec.MountpointS3PodAttachments {
 		filteredUIDs := []crdv2.WorkloadAttachment{}
@@ -617,6 +617,11 @@ func (r *Reconciler) removeWorkloadFromS3PodAttachment(ctx context.Context, s3pa
 			}
 			log.Error(err, "Failed to delete MountpointS3PodAttachment")
 			return Requeue, err
+		}
+		log.Info("Deleted MountpointS3PodAttachment as it no longer has any attached Mountpoint Pods")
+		if r.s3paExpectations.isPending(fieldFilters) {
+			log.Info("Clearing stale creation expectation for deleted MountpointS3PodAttachment")
+			r.s3paExpectations.clear(fieldFilters)
 		}
 	}
 
