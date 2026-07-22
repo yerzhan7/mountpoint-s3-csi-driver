@@ -2,6 +2,7 @@
 
 ### Notable changes
 * Removed support for AL2, and Ubuntu 22.04.
+* Drop support for Kubernetes 1.30.
 
 # v2.7.0
 
