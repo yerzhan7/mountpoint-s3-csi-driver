@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"sync"
 	"syscall"
 	"time"
@@ -25,18 +26,26 @@ const errorFileExt = ".error"
 
 // ProcessManager tracks and manages Mountpoint child processes.
 type ProcessManager struct {
-	commDir   string
-	runner    ProcessRunner // interface for spawning processes; substituted in tests
+	commDir string
+	runner  ProcessRunner // interface for spawning processes; substituted in tests
+
+	// Both from [resolveMemoryTargetMiB]; at most one is meaningful. 0 leaves `--memory-target` unset;
+	// a non-nil error makes Launch refuse mounts that do not set it themselves.
+	memoryTargetMiB int64
+	memoryTargetErr error
+
 	mu        sync.Mutex
 	processes map[string]ProcessHandle // mountId -> process handle
 	wg        sync.WaitGroup           // tracks waiter goroutines
 }
 
-func NewProcessManager(commDir string, runner ProcessRunner) *ProcessManager {
+func NewProcessManager(commDir string, runner ProcessRunner, memoryTargetMiB int64, memoryTargetErr error) *ProcessManager {
 	return &ProcessManager{
-		commDir:   commDir,
-		runner:    runner,
-		processes: make(map[string]ProcessHandle),
+		commDir:         commDir,
+		runner:          runner,
+		memoryTargetMiB: memoryTargetMiB,
+		memoryTargetErr: memoryTargetErr,
+		processes:       make(map[string]ProcessHandle),
 	}
 }
 
@@ -51,6 +60,20 @@ func (pm *ProcessManager) Launch(mountId string, mountpointPath string, options 
 
 	args := mountpoint.ParseArgs(options.Args)
 	args.Set(mountpoint.ArgForeground, mountpoint.ArgNoValue)
+
+	if !args.Has(mountpoint.ArgMemoryTarget) {
+		if pm.memoryTargetErr != nil {
+			// Mountpoint's CLI would reject the undersized share with a usage error naming a flag the
+			// user never wrote, so refuse before spawning and report the sizing itself instead.
+			fuseDev.Close()
+			pm.writeErrorFile(mountId, []byte(pm.memoryTargetErr.Error()))
+			return fmt.Errorf("mount %s needs a %s this pod cannot provide: %w",
+				mountId, mountpoint.ArgMemoryTarget, pm.memoryTargetErr)
+		}
+		if pm.memoryTargetMiB > 0 {
+			args.Set(mountpoint.ArgMemoryTarget, strconv.FormatInt(pm.memoryTargetMiB, 10))
+		}
+	}
 
 	cmdArgs := append([]string{
 		options.BucketName,
@@ -97,11 +120,7 @@ func (pm *ProcessManager) Launch(mountId string, mountpointPath string, options 
 		pm.mu.Unlock()
 
 		if exitCode != 0 {
-			errPath := filepath.Join(pm.commDir, mountId+errorFileExt)
-			// TODO(vlaad): write error file atomically (open,write,rename)
-			if writeErr := os.WriteFile(errPath, stderr, errorFilePerm); writeErr != nil {
-				klog.Errorf("Failed to write error file for mount %s: %v", mountId, writeErr)
-			}
+			pm.writeErrorFile(mountId, stderr)
 			klog.Errorf("Mountpoint for mount %s exited with code %d", mountId, exitCode)
 		} else {
 			klog.Infof("Mountpoint for mount %s exited cleanly", mountId)
@@ -109,6 +128,16 @@ func (pm *ProcessManager) Launch(mountId string, mountpointPath string, options 
 	}()
 
 	return nil
+}
+
+// writeErrorFile reports a mount failure to the driver, whose waitForMount polls for this file — the
+// only reply channel on the otherwise one-way mount socket.
+func (pm *ProcessManager) writeErrorFile(mountId string, content []byte) {
+	errPath := filepath.Join(pm.commDir, mountId+errorFileExt)
+	// TODO(vlaad): write error file atomically (open,write,rename)
+	if err := os.WriteFile(errPath, content, errorFilePerm); err != nil {
+		klog.Errorf("Failed to write error file for mount %s: %v", mountId, err)
+	}
 }
 
 // Shutdown sends SIGTERM to all processes and waits for them to exit.
