@@ -30,7 +30,9 @@ const (
 	EnvNoProxy                         = "NO_PROXY"
 )
 
-const mountpointEnvPrefix = "mountpointEnv."
+// MountpointEnvPrefix is the prefix of the volume context keys used to pass
+// user-provided environment variables to Mountpoint.
+const MountpointEnvPrefix = "mountpointEnv."
 
 // Key represents an environment variable name.
 type Key = string
@@ -80,7 +82,7 @@ func Default() Environment {
 func ParseUserEnvFromVolumeContext(volumeCtx map[string]string) (Environment, error) {
 	env := Environment{}
 	for key, value := range volumeCtx {
-		envName, ok := strings.CutPrefix(key, mountpointEnvPrefix)
+		envName, ok := strings.CutPrefix(key, MountpointEnvPrefix)
 		if !ok {
 			continue
 		}

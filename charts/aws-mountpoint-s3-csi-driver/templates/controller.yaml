@@ -1,4 +1,8 @@
-{{- if ne .Values.experimental.mounterMode "daemonset" -}}
+{{- $daemonsetMounterMode := eq .Values.experimental.mounterMode "daemonset" -}}
+{{- $dynamicProvisioning := eq (include "aws-mountpoint-s3-csi-driver.dynamicProvisioning" .) "true" -}}
+{{/* In daemonset mounter mode there are no Mountpoint Pods to reconcile, the controller is only
+     needed to serve CSI's controller service for dynamic provisioning. */}}
+{{- if or (not $daemonsetMounterMode) $dynamicProvisioning -}}
 kind: Deployment
 apiVersion: apps/v1
 metadata:
@@ -48,6 +52,10 @@ spec:
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           command:
             - "/bin/aws-s3-csi-controller"
+          {{- if $dynamicProvisioning }}
+          args:
+            - --csi-endpoint=$(CSI_ENDPOINT)
+          {{- end }}
           securityContext:
             readOnlyRootFilesystem: true
             allowPrivilegeEscalation: false
@@ -84,4 +92,54 @@ spec:
             - name: MOUNTPOINT_HEADROOM_IMAGE
               value: {{ .Values.experimental.headroomPodImage }}
             {{- end }}
+            {{- if $daemonsetMounterMode }}
+            - name: MOUNTER_MODE
+              value: daemonset
+            {{- end }}
+            {{- if $dynamicProvisioning }}
+            - name: ENABLE_DYNAMIC_PROVISIONING
+              value: "true"
+            - name: CSI_ENDPOINT
+              value: unix:///var/lib/csi/sockets/pluginproxy/csi.sock
+            {{- end }}
+          {{- if $dynamicProvisioning }}
+          volumeMounts:
+            - name: socket-dir
+              mountPath: /var/lib/csi/sockets/pluginproxy/
+          {{- end }}
+        {{- if $dynamicProvisioning }}
+        - name: csi-provisioner
+          image: {{ include "provisionerImageName" . }}
+          imagePullPolicy: {{ default .Values.image.pullPolicy .Values.sidecars.provisioner.image.pullPolicy }}
+          args:
+            - --csi-address=$(ADDRESS)
+            # Passes the PersistentVolume and PersistentVolumeClaim identity as `CreateVolume`
+            # parameters, which the CSI Driver needs to resolve the `prefixPattern` StorageClass parameter.
+            - --extra-create-metadata
+            - --leader-election
+            - --leader-election-namespace=$(NAMESPACE)
+            - --v={{ .Values.sidecars.provisioner.logLevel }}
+          securityContext:
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+          env:
+            - name: ADDRESS
+              value: /var/lib/csi/sockets/pluginproxy/csi.sock
+            - name: NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+          volumeMounts:
+            - name: socket-dir
+              mountPath: /var/lib/csi/sockets/pluginproxy/
+          {{- with default .Values.controller.resources .Values.sidecars.provisioner.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+        {{- end }}
+      {{- if $dynamicProvisioning }}
+      volumes:
+        - name: socket-dir
+          emptyDir: {}
+      {{- end }}
 {{- end }}

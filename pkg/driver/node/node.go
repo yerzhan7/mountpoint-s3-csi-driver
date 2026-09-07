@@ -138,6 +138,17 @@ func (ns *S3NodeServer) NodePublishVolume(ctx context.Context, req *csi.NodePubl
 		return nil, status.Errorf(codes.InvalidArgument, "Running mount-s3 with %s is not supported in CSI Driver.", mountpoint.ArgCABundle)
 	}
 
+	// Dynamically provisioned volumes get their prefix from the volume context, as the CSI Driver
+	// resolves it per-volume in `CreateVolume` - see `pkg/driver/controller`. Statically provisioned
+	// volumes use the `--prefix` mount option instead, and the two are mutually exclusive.
+	if prefix := volumeCtx[volumecontext.Prefix]; prefix != "" {
+		if args.Has(mountpoint.ArgPrefix) {
+			return nil, status.Errorf(codes.InvalidArgument, "Both %q volume attribute and %s mount option are provided, they are mutually exclusive.",
+				volumecontext.Prefix, mountpoint.ArgPrefix)
+		}
+		args.Set(mountpoint.ArgPrefix, prefix)
+	}
+
 	fsGroup := ""
 	if capMount := volCap.GetMount(); capMount != nil {
 		if volumeMountGroup := capMount.GetVolumeMountGroup(); volumeMountGroup != "" {

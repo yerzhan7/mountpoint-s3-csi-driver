@@ -85,6 +85,14 @@ sidecars:
       - mountPath: /csi
         name: plugin-dir
     resources: {}
+  # Only deployed if `experimental.dynamicProvisioning` is enabled.
+  provisioner:
+    image:
+      repository: public.ecr.aws/csi-components/csi-provisioner
+      tag: v5.3.0-eksbuild.2
+      pullPolicy: IfNotPresent
+    logLevel: 2
+    resources: {}
 
 controller:
   # Consider deploying the controller component to special nodes for controller components.
@@ -144,9 +152,16 @@ experimental:
   # WARNING: daemonset mode implementation is not complete - it is only exposed to allow testing.
   # In-place updates with daemonset mode may not be supported.
   # Mounter mode: "pod" (V2 default) or "daemonset" (experimental two-daemonset architecture).
-  # In daemonset mode, one mounter daemonset pod handles all mountpoint processes instead of 
+  # In daemonset mode, one mounter daemonset pod handles all mountpoint processes instead of
   # one mountpoint pod per workload in pod mode.
   mounterMode: "daemonset"
+  # WARNING: dynamic provisioning is only supported with `mounterMode: "daemonset"`.
+  # Enables dynamic provisioning of PersistentVolumes from pre-created Amazon S3 buckets.
+  # Cluster admins create StorageClasses with `provisioner: s3.csi.aws.com` and a pre-created
+  # `bucketName` parameter, and the CSI Driver then provisions a PersistentVolume for each
+  # PersistentVolumeClaim requesting a volume from them. The CSI Driver does not create or delete
+  # the buckets, nor the objects within them - that stays with the cluster admins.
+  dynamicProvisioning: false
 
 # WARNING: daemonset mode implementation is not complete - it is only exposed to allow testing.
 # Configuration for the secondary mounter daemonset(s).

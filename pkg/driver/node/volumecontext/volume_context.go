@@ -6,6 +6,11 @@ const (
 	AuthenticationSource = "authenticationSource"
 	STSRegion            = "stsRegion"
 
+	// Prefix is the S3 key prefix to mount. It's populated by the CSI Controller Service for
+	// dynamically provisioned volumes, statically provisioned volumes use the `--prefix`
+	// mount option instead.
+	Prefix = "prefix"
+
 	Cache                                = "cache"
 	CacheTypeEmptyDir                    = "emptyDir"
 	CacheTypeEphemeral                   = "ephemeral"

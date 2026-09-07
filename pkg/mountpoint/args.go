@@ -13,6 +13,7 @@ const (
 	ArgReadOnly        = "--read-only"
 	ArgAllowOther      = "--allow-other"
 	ArgAllowRoot       = "--allow-root"
+	ArgPrefix          = "--prefix"
 	ArgRegion          = "--region"
 	ArgCache           = "--cache"
 	ArgMaxCacheSize    = "--max-cache-size"

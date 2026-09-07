@@ -191,7 +191,7 @@ func NewDriver(endpoint string, mpVersion string, nodeID string) (*Driver, error
 }
 
 func (d *Driver) Run() error {
-	scheme, addr, err := ParseEndpoint(d.Endpoint)
+	scheme, addr, err := util.ParseCSIEndpoint(d.Endpoint)
 	if err != nil {
 		return err
 	}

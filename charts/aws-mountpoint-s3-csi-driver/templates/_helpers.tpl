@@ -18,6 +18,22 @@ Expand the name of the chart.
 {{ include "renderImageName" (dict "image" .Values.sidecars.livenessProbe.image "eksImage" "/eks/livenessprobe" "isEKSAddon" .Values.isEKSAddon ) }}
 {{- end -}}
 
+{{- define "provisionerImageName" -}}
+{{ include "renderImageName" (dict "image" .Values.sidecars.provisioner.image "eksImage" "/eks/csi-provisioner" "isEKSAddon" .Values.isEKSAddon ) }}
+{{- end -}}
+
+{{/*
+Whether dynamic provisioning is enabled. Fails if it's enabled with an unsupported mounter mode.
+*/}}
+{{- define "aws-mountpoint-s3-csi-driver.dynamicProvisioning" -}}
+{{- if .Values.experimental.dynamicProvisioning -}}
+{{- if ne .Values.experimental.mounterMode "daemonset" -}}
+{{- fail "experimental.dynamicProvisioning is only supported with experimental.mounterMode: daemonset" -}}
+{{- end -}}
+{{- true -}}
+{{- end -}}
+{{- end -}}
+
 {{- define "renderImageName" -}}
 {{ printf "%s%s:%s" (default "" .image.containerRegistry) (ternary .image.repository .eksImage (empty .isEKSAddon)) .image.tag }}
 {{- end -}}
