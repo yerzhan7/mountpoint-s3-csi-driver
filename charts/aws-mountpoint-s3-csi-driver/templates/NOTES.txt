@@ -15,6 +15,12 @@ This setting only applies in daemonset mode (it controls draining/refreshing of 
 during a V2 -> V3 upgrade) and is ignored otherwise. No action is required; the value has no effect
 in the current mode. If you did not intend to run outside daemonset mode, set `experimental.mounterMode=daemonset`.
 {{- end }}
+{{- if and .Values.node.preventPodSchedulingIfMissing (semverCompare "<1.37.0-0" .Capabilities.KubeVersion.Version) }}
+
+WARNING: `node.preventPodSchedulingIfMissing` is enabled, but this cluster runs Kubernetes {{ .Capabilities.KubeVersion.Version }}.
+The setting takes effect from Kubernetes 1.37 (on 1.36, only with the alpha VolumeLimitScaling feature gate enabled),
+so on this cluster the scheduler can still place Pods that use S3 volumes on nodes where the CSI Driver isn't registered.
+{{- end }}
 {{- if eq .Values.experimental.mounterMode "daemonset"}}
 
 IMPORTANT: After helm upgrade, mounter pods continue running the previous version (OnDelete strategy) to avoid disrupting active mounts.
